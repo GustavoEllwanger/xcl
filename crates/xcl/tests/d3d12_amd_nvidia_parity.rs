@@ -74,12 +74,31 @@ struct SegmentUsage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessCommit {
+    bytes: u64,
+    source: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MemSnap {
     private_commit: u64,
+    commit_source: &'static str,
     local: SegmentUsage,
     /// `None` when `QueryVideoMemoryInfo(NON_LOCAL)` returns an error so an unavailable
     /// segment is never confused with a reported `0` usage/budget.
     nonlocal: Option<SegmentUsage>,
+}
+
+fn select_process_commit(private_usage: usize, pagefile_usage: usize) -> Result<ProcessCommit, String> {
+    if private_usage > 0 {
+        Ok(ProcessCommit { bytes: private_usage as u64, source: "PrivateUsage" })
+    } else if pagefile_usage > 0 {
+        // Wine returns TRUE from K32GetProcessMemoryInfo with PrivateUsage == 0 while populating
+        // PagefileUsage with the process commit charge.
+        Ok(ProcessCommit { bytes: pagefile_usage as u64, source: "PagefileUsage" })
+    } else {
+        Err("K32GetProcessMemoryInfo returned both PrivateUsage=0 and PagefileUsage=0".into())
+    }
 }
 
 fn mem_snap_from_queries<FProc, FLoc, FNonLoc>(
@@ -88,14 +107,14 @@ fn mem_snap_from_queries<FProc, FLoc, FNonLoc>(
     nonlocal_query: FNonLoc,
 ) -> Result<MemSnap, String>
 where
-    FProc: FnOnce() -> Result<u64, String>,
+    FProc: FnOnce() -> Result<ProcessCommit, String>,
     FLoc: FnOnce() -> Result<SegmentUsage, String>,
     FNonLoc: FnOnce() -> Result<SegmentUsage, String>,
 {
-    let private_commit = proc_query()?;
+    let commit = proc_query()?;
     let local = local_query()?;
     let nonlocal = nonlocal_query().ok();
-    Ok(MemSnap { private_commit, local, nonlocal })
+    Ok(MemSnap { private_commit: commit.bytes, commit_source: commit.source, local, nonlocal })
 }
 
 fn mem_snap(adapter: &IDXGIAdapter3) -> Result<MemSnap, String> {
@@ -108,7 +127,7 @@ fn mem_snap(adapter: &IDXGIAdapter3) -> Result<MemSnap, String> {
                 if ok == 0 {
                     return Err(format!("K32GetProcessMemoryInfo failed: {}", std::io::Error::last_os_error()));
                 }
-                Ok(c.PrivateUsage as u64)
+                select_process_commit(c.PrivateUsage, c.PagefileUsage)
             },
             || {
                 let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -156,26 +175,41 @@ fn format_nonlocal_delta(
 
 #[test]
 fn mem_snap_rejects_required_query_failures_and_marks_unavailable_nonlocal() {
+    let ok_commit = || Ok(ProcessCommit { bytes: 1234, source: "PrivateUsage" });
     let ok_local = || Ok(SegmentUsage { current: 4096, budget: 8192 });
     let ok_nonlocal = || Ok(SegmentUsage { current: 0, budget: 0 });
+
+    // Windows populates PrivateUsage (preferred); Wine leaves PrivateUsage == 0 and populates PagefileUsage.
+    assert_eq!(
+        select_process_commit(8192, 16384),
+        Ok(ProcessCommit { bytes: 8192, source: "PrivateUsage" }),
+    );
+    assert_eq!(
+        select_process_commit(0, 16384),
+        Ok(ProcessCommit { bytes: 16384, source: "PagefileUsage" }),
+    );
+    assert!(
+        select_process_commit(0, 0).is_err(),
+        "both PrivateUsage=0 and PagefileUsage=0 must fail instead of silently reporting 0 commit",
+    );
 
     // A failed K32GetProcessMemoryInfo must fail rather than reporting 0 private commit.
     let err_proc = mem_snap_from_queries(|| Err("proc failed".into()), ok_local, ok_nonlocal);
     assert!(err_proc.is_err(), "process memory query failure must return Err");
 
     // A failed LOCAL QueryVideoMemoryInfo must fail rather than reporting 0 VRAM/budget.
-    let err_local = mem_snap_from_queries(|| Ok(1234), || Err("local failed".into()), ok_nonlocal);
+    let err_local = mem_snap_from_queries(ok_commit, || Err("local failed".into()), ok_nonlocal);
     assert!(err_local.is_err(), "LOCAL DXGI query failure must return Err");
 
     // A failed NON_LOCAL query marks the segment explicitly unavailable (distinct from 0).
-    let unavail = mem_snap_from_queries(|| Ok(1234), ok_local, || Err("nonlocal unsupported".into()))
+    let unavail = mem_snap_from_queries(ok_commit, ok_local, || Err("nonlocal unsupported".into()))
         .expect("unavailable NON_LOCAL should still return snapshot");
     assert_eq!(unavail.nonlocal, None);
     assert_eq!(format_optional_mib(unavail.nonlocal.map(|s| s.budget)), "unavailable");
     assert_eq!(format_nonlocal_delta(unavail.nonlocal, unavail.nonlocal, unavail.nonlocal), "unavailable");
 
     // A succeeding NON_LOCAL query reporting 0 stays distinct from unavailable.
-    let zero = mem_snap_from_queries(|| Ok(1234), ok_local, ok_nonlocal).expect("zero NON_LOCAL");
+    let zero = mem_snap_from_queries(ok_commit, ok_local, ok_nonlocal).expect("zero NON_LOCAL");
     assert_eq!(zero.nonlocal, Some(SegmentUsage { current: 0, budget: 0 }));
     assert_eq!(format_optional_mib(zero.nonlocal.map(|s| s.budget)), "0");
     assert_eq!(format_nonlocal_delta(zero.nonlocal, zero.nonlocal, zero.nonlocal), "  +0.0->  +0.0");
@@ -522,8 +556,6 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         (cs_rs, gfx_rs)
     };
 
-    println!("WS7_PSO_ADAPTER | {}", hw.name);
-
     // Pre-compile DXIL blobs BEFORE taking memory snapshots so DXC compiler allocations are excluded
     // from the driver Create*PipelineState deltas.
     let compile_cs_batch = |kind: &str, n: usize, distinct: bool| -> Vec<Vec<u8>> {
@@ -565,6 +597,7 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
     }
 
     let baseline_all = mem_snap(&hw.adapter).expect("WS7 baseline memory snapshot");
+    println!("WS7_PSO_ADAPTER | {} | commit_src={}", hw.name, baseline_all.commit_source);
 
     for (label, blobs) in [
         ("cs_small_128_distinct", &cs_small),
@@ -596,6 +629,9 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         }
 
         let n = blobs.len() as f64;
+        assert_eq!(before.commit_source, baseline_all.commit_source);
+        assert_eq!(live.commit_source, baseline_all.commit_source);
+        assert_eq!(after.commit_source, baseline_all.commit_source);
         let c_live = signed_delta_kib(live.private_commit, before.private_commit);
         let c_after = signed_delta_kib(after.private_commit, before.private_commit);
         let c_cum = signed_delta_kib(after.private_commit, baseline_all.private_commit);
@@ -655,6 +691,9 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         }
 
         let n = gfx_pairs.len() as f64;
+        assert_eq!(before.commit_source, baseline_all.commit_source);
+        assert_eq!(live.commit_source, baseline_all.commit_source);
+        assert_eq!(after.commit_source, baseline_all.commit_source);
         let c_live = signed_delta_kib(live.private_commit, before.private_commit);
         let c_after = signed_delta_kib(after.private_commit, before.private_commit);
         let c_cum = signed_delta_kib(after.private_commit, baseline_all.private_commit);
