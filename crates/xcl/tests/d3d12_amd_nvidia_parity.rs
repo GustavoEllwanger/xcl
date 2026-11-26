@@ -67,38 +67,118 @@ fn open_hw_adapter() -> Option<HwAdapter> {
     None
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MemSnap {
-    private_commit: u64,
-    local_vram: u64,
-    local_budget: u64,
-    nonlocal_vram: u64,
-    nonlocal_budget: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentUsage {
+    current: u64,
+    budget: u64,
 }
 
-fn mem_snap(adapter: &IDXGIAdapter3) -> MemSnap {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemSnap {
+    private_commit: u64,
+    local: SegmentUsage,
+    /// `None` when `QueryVideoMemoryInfo(NON_LOCAL)` returns an error so an unavailable
+    /// segment is never confused with a reported `0` usage/budget.
+    nonlocal: Option<SegmentUsage>,
+}
+
+fn mem_snap_from_queries<FProc, FLoc, FNonLoc>(
+    proc_query: FProc,
+    local_query: FLoc,
+    nonlocal_query: FNonLoc,
+) -> Result<MemSnap, String>
+where
+    FProc: FnOnce() -> Result<u64, String>,
+    FLoc: FnOnce() -> Result<SegmentUsage, String>,
+    FNonLoc: FnOnce() -> Result<SegmentUsage, String>,
+{
+    let private_commit = proc_query()?;
+    let local = local_query()?;
+    let nonlocal = nonlocal_query().ok();
+    Ok(MemSnap { private_commit, local, nonlocal })
+}
+
+fn mem_snap(adapter: &IDXGIAdapter3) -> Result<MemSnap, String> {
     unsafe {
-        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-        c.cb = std::mem::size_of_val(&c) as u32;
-        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
-
-        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let _ = adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local);
-        let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let _ = adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal);
-
-        MemSnap {
-            private_commit: c.PrivateUsage as u64,
-            local_vram: local.CurrentUsage,
-            local_budget: local.Budget,
-            nonlocal_vram: nonlocal.CurrentUsage,
-            nonlocal_budget: nonlocal.Budget,
-        }
+        mem_snap_from_queries(
+            || {
+                let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+                c.cb = std::mem::size_of_val(&c) as u32;
+                let ok = K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
+                if ok == 0 {
+                    return Err(format!("K32GetProcessMemoryInfo failed: {}", std::io::Error::last_os_error()));
+                }
+                Ok(c.PrivateUsage as u64)
+            },
+            || {
+                let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                adapter
+                    .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)
+                    .map_err(|e| format!("QueryVideoMemoryInfo(LOCAL) failed: {e}"))?;
+                Ok(SegmentUsage { current: local.CurrentUsage, budget: local.Budget })
+            },
+            || {
+                let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                adapter
+                    .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal)
+                    .map_err(|e| format!("QueryVideoMemoryInfo(NON_LOCAL) failed: {e}"))?;
+                Ok(SegmentUsage { current: nonlocal.CurrentUsage, budget: nonlocal.Budget })
+            },
+        )
     }
 }
 
 fn signed_delta_kib(after: u64, before: u64) -> f64 {
     (after as i128 - before as i128) as f64 / 1024.0
+}
+
+fn format_optional_mib(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(b) => (b >> 20).to_string(),
+        None => "unavailable".to_string(),
+    }
+}
+
+fn format_nonlocal_delta(
+    before: Option<SegmentUsage>,
+    live: Option<SegmentUsage>,
+    after: Option<SegmentUsage>,
+) -> String {
+    match (before, live, after) {
+        (Some(b), Some(l), Some(a)) => format!(
+            "{:+6.1}->{:+6.1}",
+            signed_delta_kib(l.current, b.current),
+            signed_delta_kib(a.current, b.current),
+        ),
+        _ => "unavailable".to_string(),
+    }
+}
+
+#[test]
+fn mem_snap_rejects_required_query_failures_and_marks_unavailable_nonlocal() {
+    let ok_local = || Ok(SegmentUsage { current: 4096, budget: 8192 });
+    let ok_nonlocal = || Ok(SegmentUsage { current: 0, budget: 0 });
+
+    // A failed K32GetProcessMemoryInfo must fail rather than reporting 0 private commit.
+    let err_proc = mem_snap_from_queries(|| Err("proc failed".into()), ok_local, ok_nonlocal);
+    assert!(err_proc.is_err(), "process memory query failure must return Err");
+
+    // A failed LOCAL QueryVideoMemoryInfo must fail rather than reporting 0 VRAM/budget.
+    let err_local = mem_snap_from_queries(|| Ok(1234), || Err("local failed".into()), ok_nonlocal);
+    assert!(err_local.is_err(), "LOCAL DXGI query failure must return Err");
+
+    // A failed NON_LOCAL query marks the segment explicitly unavailable (distinct from 0).
+    let unavail = mem_snap_from_queries(|| Ok(1234), ok_local, || Err("nonlocal unsupported".into()))
+        .expect("unavailable NON_LOCAL should still return snapshot");
+    assert_eq!(unavail.nonlocal, None);
+    assert_eq!(format_optional_mib(unavail.nonlocal.map(|s| s.budget)), "unavailable");
+    assert_eq!(format_nonlocal_delta(unavail.nonlocal, unavail.nonlocal, unavail.nonlocal), "unavailable");
+
+    // A succeeding NON_LOCAL query reporting 0 stays distinct from unavailable.
+    let zero = mem_snap_from_queries(|| Ok(1234), ok_local, ok_nonlocal).expect("zero NON_LOCAL");
+    assert_eq!(zero.nonlocal, Some(SegmentUsage { current: 0, budget: 0 }));
+    assert_eq!(format_optional_mib(zero.nonlocal.map(|s| s.budget)), "0");
+    assert_eq!(format_nonlocal_delta(zero.nonlocal, zero.nonlocal, zero.nonlocal), "  +0.0->  +0.0");
 }
 
 #[test]
@@ -127,7 +207,7 @@ fn ws9_adapter_capabilities_and_dxgi_budget() {
             .CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &mut arch as *mut _ as *mut c_void, std::mem::size_of_val(&arch) as u32)
             .expect("ARCHITECTURE1");
 
-        let snap = mem_snap(&hw.adapter);
+        let snap = mem_snap(&hw.adapter).expect("WS9 memory snapshot");
         println!(
             "WS9_ADAPTER | name={} | vendor={:#06x} | device={:#06x} | ded_vram_mib={} | shared_sys_mib={} | uma={} | coherent_uma={} | tiled_tier={} | heap_tier={} | bind_tier={} | wave_ops={} | wave_min={} | wave_max={} | total_lanes={} | mesh_tier={} | local_budget_mib={} | local_used_mib={} | nonlocal_budget_mib={} | nonlocal_used_mib={}",
             hw.name,
@@ -145,14 +225,14 @@ fn ws9_adapter_capabilities_and_dxgi_budget() {
             if has_opts1 { opts1.WaveLaneCountMax } else { 0 },
             if has_opts1 { opts1.TotalLaneCount } else { 0 },
             if has_opts7 { opts7.MeshShaderTier.0 } else { 0 },
-            snap.local_budget >> 20,
-            snap.local_vram >> 20,
-            snap.nonlocal_budget >> 20,
-            snap.nonlocal_vram >> 20,
+            snap.local.budget >> 20,
+            snap.local.current >> 20,
+            format_optional_mib(snap.nonlocal.map(|s| s.budget)),
+            format_optional_mib(snap.nonlocal.map(|s| s.current)),
         );
 
         assert!(opts.TiledResourcesTier.0 >= 1, "expected tiled resources support on hardware adapter");
-        assert!(snap.local_budget > 0, "expected non-zero DXGI local video memory budget");
+        assert!(snap.local.budget > 0, "expected non-zero DXGI local video memory budget");
     }
 }
 
@@ -484,7 +564,7 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         drop(warmup);
     }
 
-    let baseline_all = mem_snap(&hw.adapter);
+    let baseline_all = mem_snap(&hw.adapter).expect("WS7 baseline memory snapshot");
 
     for (label, blobs) in [
         ("cs_small_128_distinct", &cs_small),
@@ -494,7 +574,7 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         ("cs_large_32_distinct", &cs_large),
     ] {
         let avg_dxil = blobs.iter().map(Vec::len).sum::<usize>() / blobs.len();
-        let before = mem_snap(&hw.adapter);
+        let before = mem_snap(&hw.adapter).expect("WS7 pre-batch memory snapshot");
         let t0 = Instant::now();
         let mut psos: Vec<ID3D12PipelineState> = Vec::with_capacity(blobs.len());
         unsafe {
@@ -508,9 +588,9 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
             }
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let live = mem_snap(&hw.adapter);
+        let live = mem_snap(&hw.adapter).expect("WS7 live memory snapshot");
         drop(psos);
-        let after = mem_snap(&hw.adapter);
+        let after = mem_snap(&hw.adapter).expect("WS7 post-release memory snapshot");
         unsafe {
             assert!(hw.dev.GetDeviceRemovedReason().is_ok(), "device removed during {label}");
         }
@@ -519,13 +599,12 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         let c_live = signed_delta_kib(live.private_commit, before.private_commit);
         let c_after = signed_delta_kib(after.private_commit, before.private_commit);
         let c_cum = signed_delta_kib(after.private_commit, baseline_all.private_commit);
-        let v_live = signed_delta_kib(live.local_vram, before.local_vram);
-        let v_after = signed_delta_kib(after.local_vram, before.local_vram);
-        let v_cum = signed_delta_kib(after.local_vram, baseline_all.local_vram);
-        let nv_live = signed_delta_kib(live.nonlocal_vram, before.nonlocal_vram);
-        let nv_after = signed_delta_kib(after.nonlocal_vram, before.nonlocal_vram);
+        let v_live = signed_delta_kib(live.local.current, before.local.current);
+        let v_after = signed_delta_kib(after.local.current, before.local.current);
+        let v_cum = signed_delta_kib(after.local.current, baseline_all.local.current);
+        let nonloc = format_nonlocal_delta(before.nonlocal, live.nonlocal, after.nonlocal);
         println!(
-            "WS7_ROW | {:22} | n={:3} | dxil_B={:6} | ms={:7.1} | commit_kib={:+8.1} ({:+.1}/pso) | after_rel={:+8.1} (cum={:+9.1}) | vram_loc={:+7.1} ({:+.1}/pso) | after_loc={:+7.1} (cum={:+8.1}) | nonloc={:+6.1}->{:+6.1}",
+            "WS7_ROW | {:22} | n={:3} | dxil_B={:6} | ms={:7.1} | commit_kib={:+8.1} ({:+.1}/pso) | after_rel={:+8.1} (cum={:+9.1}) | vram_loc={:+7.1} ({:+.1}/pso) | after_loc={:+7.1} (cum={:+8.1}) | nonloc={}",
             label,
             blobs.len(),
             avg_dxil,
@@ -538,15 +617,14 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
             v_live / n,
             v_after,
             v_cum,
-            nv_live,
-            nv_after,
+            nonloc,
         );
     }
 
     // Graphics PSO batch (VS + PS)
     {
         let avg_dxil = gfx_pairs.iter().map(|(v, p)| v.len() + p.len()).sum::<usize>() / gfx_pairs.len();
-        let before = mem_snap(&hw.adapter);
+        let before = mem_snap(&hw.adapter).expect("WS7 pre-batch gfx memory snapshot");
         let t0 = Instant::now();
         let mut psos: Vec<ID3D12PipelineState> = Vec::with_capacity(gfx_pairs.len());
         unsafe {
@@ -569,9 +647,9 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
             }
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let live = mem_snap(&hw.adapter);
+        let live = mem_snap(&hw.adapter).expect("WS7 live gfx memory snapshot");
         drop(psos);
-        let after = mem_snap(&hw.adapter);
+        let after = mem_snap(&hw.adapter).expect("WS7 post-release gfx memory snapshot");
         unsafe {
             assert!(hw.dev.GetDeviceRemovedReason().is_ok(), "device removed during gfx_vs_ps_128_distinct");
         }
@@ -580,13 +658,12 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
         let c_live = signed_delta_kib(live.private_commit, before.private_commit);
         let c_after = signed_delta_kib(after.private_commit, before.private_commit);
         let c_cum = signed_delta_kib(after.private_commit, baseline_all.private_commit);
-        let v_live = signed_delta_kib(live.local_vram, before.local_vram);
-        let v_after = signed_delta_kib(after.local_vram, before.local_vram);
-        let v_cum = signed_delta_kib(after.local_vram, baseline_all.local_vram);
-        let nv_live = signed_delta_kib(live.nonlocal_vram, before.nonlocal_vram);
-        let nv_after = signed_delta_kib(after.nonlocal_vram, before.nonlocal_vram);
+        let v_live = signed_delta_kib(live.local.current, before.local.current);
+        let v_after = signed_delta_kib(after.local.current, before.local.current);
+        let v_cum = signed_delta_kib(after.local.current, baseline_all.local.current);
+        let nonloc = format_nonlocal_delta(before.nonlocal, live.nonlocal, after.nonlocal);
         println!(
-            "WS7_ROW | {:22} | n={:3} | dxil_B={:6} | ms={:7.1} | commit_kib={:+8.1} ({:+.1}/pso) | after_rel={:+8.1} (cum={:+9.1}) | vram_loc={:+7.1} ({:+.1}/pso) | after_loc={:+7.1} (cum={:+8.1}) | nonloc={:+6.1}->{:+6.1}",
+            "WS7_ROW | {:22} | n={:3} | dxil_B={:6} | ms={:7.1} | commit_kib={:+8.1} ({:+.1}/pso) | after_rel={:+8.1} (cum={:+9.1}) | vram_loc={:+7.1} ({:+.1}/pso) | after_loc={:+7.1} (cum={:+8.1}) | nonloc={}",
             "gfx_vs_ps_128_distinct",
             gfx_pairs.len(),
             avg_dxil,
@@ -599,8 +676,7 @@ fn ws7_driver_pipeline_memory_for_same_dxil() {
             v_live / n,
             v_after,
             v_cum,
-            nv_live,
-            nv_after,
+            nonloc,
         );
     }
 }
